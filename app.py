@@ -1,111 +1,88 @@
-# Streamlit NASA Weather Data App with Multiple Station Comparison, CDD/HDD, and KSA Time Support
-
 import streamlit as st
 import pandas as pd
-import requests
+import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
+import requests
 from datetime import datetime, timedelta
 import pytz
-import io
 
 st.set_page_config(layout="wide")
-st.title("NASA Weather Data Explorer")
 
-# Load stations
 stations_df = pd.read_excel("stations.xlsx")
-stations_df = stations_df.dropna(subset=["Latitude", "Longitude"])
+stations = stations_df["Station Name"].tolist()
+station_coords = stations_df.set_index("Station Name")[["Latitude", "Longitude"]].to_dict("index")
 
-# Sidebar controls
+st.title("NASA Weather Dashboard")
+st.markdown("Compare hourly weather data from multiple stations using NASA POWER API")
+
 with st.sidebar:
-    st.header("User Input")
-    selected_stations = st.multiselect("Select Stations", stations_df["Station Name"], default=stations_df["Station Name"].iloc[:2])
-    start_date = st.date_input("Start Date", datetime.utcnow() - timedelta(days=30))
-    end_date = st.date_input("End Date", datetime.utcnow() - timedelta(days=3))
-    parameter = st.selectbox("Parameter", ["T2M", "T2M_MAX", "T2M_MIN", "RH2M", "PRECTOTCORR", "WS2M"])
-    submit = st.button("Fetch Data")
+    selected_stations = st.multiselect("Select Stations", stations, default=stations[:1])
+    parameter = st.selectbox("Select Parameter", ["T2M", "RH2M", "PRECTOTCORR", "WS2M"])
+    start_date = st.date_input("Start Date", datetime(2025, 10, 1))
+    end_date = st.date_input("End Date", datetime.utcnow().date() - timedelta(days=3))
+    run_button = st.button("Get Data")
 
-# Convert UTC to KSA
-def to_ksa_time(utc_dt):
-    ksa = pytz.timezone("Asia/Riyadh")
-    return utc_dt.replace(tzinfo=pytz.utc).astimezone(ksa)
+@st.cache_data(show_spinner=False)
+def fetch_nasa_data(lat, lon, param, start_date, end_date):
+    url = (
+        f"https://power.larc.nasa.gov/api/temporal/hourly/point?"
+        f"parameters={param}&community=RE&latitude={lat}&longitude={lon}"
+        f"&start={start_date}&end={end_date}&format=JSON&time-standard=UTC"
+    )
+    response = requests.get(url)
+    if response.status_code == 200:
+        data = response.json()
+        values = data["properties"]["parameter"][param]
+        df = pd.DataFrame(list(values.items()), columns=["datetime", param])
+        df["datetime"] = pd.to_datetime(df["datetime"], format="%Y%m%d%H")
+        df["datetime"] = df["datetime"].dt.tz_localize("UTC").dt.tz_convert("Asia/Riyadh").dt.tz_localize(None)
+        return df
+    else:
+        return pd.DataFrame()
 
-# Fetch data function
-def fetch_data(lat, lon, start, end, param):
-    base = "https://power.larc.nasa.gov/api/temporal/hourly/point"
-    url = f"{base}?parameters={param}&community=RE&latitude={lat}&longitude={lon}&start={start}&end={end}&format=JSON&time-standard=UTC"
-    while True:
-        try:
-            res = requests.get(url)
-            res.raise_for_status()
-            json_data = res.json()
-            records = json_data["properties"]["parameter"][param]
-            df = pd.DataFrame.from_dict(records, orient="index", columns=[param])
-            df.index = pd.to_datetime(df.index)
-            df = df.tz_localize("UTC").tz_convert("Asia/Riyadh")
-            df[param] = df[param].astype(float)
-            return df
-        except Exception as e:
-            st.warning(f"Retrying due to error: {e}")
-
-# Main Execution
-if submit and selected_stations:
-    tabs = st.tabs(["Data", "Charts", "CDD/HDD", "Map"])
-    combined = pd.DataFrame()
-
-    with tabs[0]:
-        st.subheader("Combined Data Table")
-
-    with tabs[1]:
-        fig_temp = go.Figure()
-
-    with tabs[2]:
-        st.subheader("Cooling & Heating Degree Days")
-        cdd_fig, hdd_fig = go.Figure(), go.Figure()
-
-    with tabs[3]:
-        st.subheader("Station Locations")
-        m = px.scatter_mapbox(
-            stations_df[stations_df["Station Name"].isin(selected_stations)],
-            lat="Latitude", lon="Longitude", text="Station Name",
-            zoom=4, height=500
-        )
-        m.update_layout(mapbox_style="open-street-map")
-        st.plotly_chart(m, use_container_width=True)
-
+if run_button and selected_stations:
+    all_data = []
     for station in selected_stations:
-        row = stations_df[stations_df["Station Name"] == station].iloc[0]
-        df = fetch_data(row.Latitude, row.Longitude, start_date.strftime('%Y%m%d'), end_date.strftime('%Y%m%d'), parameter)
-        df = df.rename(columns={parameter: station})
+        coords = station_coords[station]
+        df = fetch_nasa_data(coords["Latitude"], coords["Longitude"], parameter,
+                             start_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"))
+        if not df.empty:
+            df["station"] = station
+            all_data.append(df)
 
-        # Merge
-        if combined.empty:
-            combined = df.copy()
-        else:
-            combined = combined.join(df, how="outer")
+    if all_data:
+        merged_df = pd.concat(all_data)
 
-        # Intra-day analysis
-        intra = df.copy()
-        intra["Hour"] = intra.index.hour
-        avg_hourly = intra.groupby("Hour")[station].mean().reset_index()
-        fig_temp.add_trace(go.Scatter(x=avg_hourly["Hour"], y=avg_hourly[station], mode='lines', name=station))
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Time Series", "📈 Intra-Day", "📆 Intra-Month", "🗺️ Map"])
 
-        # CDD/HDD
-        cdd = (df[station] - 18).clip(lower=0).resample("D").sum()
-        hdd = (18 - df[station]).clip(lower=0).resample("D").sum()
-        cdd_fig.add_trace(go.Scatter(x=cdd.index, y=cdd, name=station))
-        hdd_fig.add_trace(go.Scatter(x=hdd.index, y=hdd, name=station))
+        with tab1:
+            fig = px.line(merged_df, x="datetime", y=parameter, color="station", title="Hourly Time Series")
+            st.plotly_chart(fig, use_container_width=True)
 
-    with tabs[0]:
-        st.dataframe(combined)
-        csv = combined.to_csv().encode('utf-8')
-        st.download_button("Download CSV", csv, file_name="nasa_weather_data.csv", mime="text/csv")
+        with tab2:
+            merged_df["hour"] = merged_df["datetime"].dt.hour
+            hourly_avg = merged_df.groupby(["station", "hour"])[parameter].mean().reset_index()
+            fig = px.line(hourly_avg, x="hour", y=parameter, color="station", title="Intra-Day Average (by Hour)")
+            st.plotly_chart(fig, use_container_width=True)
 
-    with tabs[1]:
-        st.plotly_chart(fig_temp, use_container_width=True)
+        with tab3:
+            merged_df["month"] = merged_df["datetime"].dt.month
+            merged_df["day"] = merged_df["datetime"].dt.day
+            fig = px.box(merged_df, x="day", y=parameter, color="station", animation_frame="month",
+                         title="Intra-Month Distribution (animated by Month)")
+            st.plotly_chart(fig, use_container_width=True)
 
-    with tabs[2]:
-        st.plotly_chart(cdd_fig, use_container_width=True)
-        st.plotly_chart(hdd_fig, use_container_width=True)
-else:
-    st.info("Select inputs from the sidebar to begin.")
+        with tab4:
+            map_df = pd.DataFrame([
+                {"station": s, "lat": station_coords[s]["Latitude"], "lon": station_coords[s]["Longitude"]}
+                for s in selected_stations
+            ])
+            st.map(map_df)
+
+        st.download_button("📥 Download Data as CSV", merged_df.to_csv(index=False), file_name="weather_data.csv")
+    else:
+        st.warning("No data returned from NASA API.")
+
+
+
+
