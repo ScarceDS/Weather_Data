@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import plotly.express as px
-from datetime import datetime
+from datetime import datetime,timedelta
 
 st.set_page_config(page_title="NASA POWER Dashboard", layout="wide")
 st.title("🌍 NASA POWER - Interactive Weather Data Explorer (KSA Time)")
