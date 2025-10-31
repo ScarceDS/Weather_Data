@@ -26,20 +26,20 @@ url = f"https://power.larc.nasa.gov/api/temporal/hourly/point?parameters={param_
 
 @st.cache_data
 def fetch_data(url):
-response = requests.get(url)
-data = response.json()
-records = data['properties']['parameter'][param_key]
-df = pd.DataFrame.from_dict(records, orient='index', columns=[param_key])
-df.index = pd.to_datetime(df.index, format="%Y%m%d%H")
-df.reset_index(inplace=True)
-df.rename(columns={"index": "Datetime"}, inplace=True)
-return df
+  response = requests.get(url)
+  data = response.json()
+  records = data['properties']['parameter'][param_key]
+  df = pd.DataFrame.from_dict(records, orient='index', columns=[param_key])
+  df.index = pd.to_datetime(df.index, format="%Y%m%d%H")
+  df.reset_index(inplace=True)
+  df.rename(columns={"index": "Datetime"}, inplace=True)
+  return df
 
 
 try:
-df = fetch_data(url)
-st.success(f"تم تحميل {len(df)} صف من البيانات.")
-st.download_button("📥 تحميل CSV", df.to_csv(index=False), file_name="weather.csv", mime="text/csv")
-st.line_chart(df.set_index("Datetime")[param_key])
+  df = fetch_data(url)
+  st.success(f"تم تحميل {len(df)} صف من البيانات.")
+  st.download_button("📥 تحميل CSV", df.to_csv(index=False), file_name="weather.csv", mime="text/csv")
+  st.line_chart(df.set_index("Datetime")[param_key])
 except Exception as e:
-st.error(f"حدث خطأ: {e}")
+  st.error(f"حدث خطأ: {e}")
