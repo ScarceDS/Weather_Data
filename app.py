@@ -13,7 +13,7 @@ stations = pd.read_excel("stations.xlsx")
 station = st.sidebar.selectbox("اختر المحطة", stations["Station Name"])
 param_key = st.sidebar.selectbox("اختر المتغير", ["T2M", "RH2M", "WS2M", "PRECTOTCORR"])
 start_date = st.sidebar.date_input("تاريخ البداية", datetime(2025, 1, 1))
-end_date = st.sidebar.date_input("تاريخ النهاية", datetime.today())
+end_date = st.sidebar.date_input("تاريخ النهاية", datetime.today() - timedelta(days=3))
 
 lat = stations[stations["Station Name"] == station]["Latitude"].values[0]
 lon = stations[stations["Station Name"] == station]["Longitude"].values[0]
