@@ -1,57 +1,79 @@
 import streamlit as st
 import pandas as pd
 import requests
+from io import BytesIO
 from datetime import datetime, timedelta
+import plotly.express as px
 
-# ---------- إعداد الواجهة ----------
-st.set_page_config(page_title="NASA Weather Dashboard", layout="wide")
-st.title("☀️ NASA Weather Dashboard")
-st.markdown("تحميل بيانات الطقس من NASA POWER API (ساعية) لعدة محطات في السعودية")
+# ------------------------------
+# Load station list from Excel
+# ------------------------------
+@st.cache_data
+def load_stations():
+    file_path = "stations.xlsx"
+    df = pd.read_excel(file_path)
+    return df[['Station Name', 'Latitude', 'Longitude']]
 
-# ---------- تحميل ملف المحطات ----------
-stations_df = pd.read_excel("stations.xlsx")
-station_names = stations_df["Station Name"].tolist()
+stations_df = load_stations()
 
-# ---------- اختيار المحطة والمعامل ----------
-selected_station = st.selectbox("📍 Select Station", station_names)
-selected_param = st.selectbox("📊 Select Parameter", ["T2M", "RH2M", "PRECTOT", "WS10M"])
-
-# ---------- اختيار الفترة الزمنية ----------
-min_date = datetime(2015, 10, 1)
-max_date = datetime(2035, 10, 1)
-col1, col2 = st.columns(2)
-start_date = col1.date_input("Start Date", value=min_date, min_value=min_date, max_value=max_date)
-end_date = col2.date_input("End Date", value=max_date - timedelta(days=1), min_value=min_date, max_value=max_date)
-
-# ---------- إحضار إحداثيات المحطة ----------
-lat = stations_df.loc[stations_df["Station Name"] == selected_station, "Latitude"].values[0]
-lon = stations_df.loc[stations_df["Station Name"] == selected_station, "Longitude"].values[0]
-
-# ---------- دالة جلب البيانات من NASA POWER ----------
-@st.cache_data(show_spinner=True)
-def fetch_weather_data(lat, lon, start_date, end_date, parameter):
+# ------------------------------
+# Fetch hourly weather data
+# ------------------------------
+def fetch_hourly_weather_data(lat, lon, start_date, end_date, parameter):
     url = (
-        f"https://power.larc.nasa.gov/api/temporal/hourly/point?"
-        f"start={start_date.strftime('%Y%m%d')}&end={end_date.strftime('%Y%m%d')}&"
-        f"latitude={lat}&longitude={lon}&community=ag&parameters={parameter}&format=JSON"
+        f"https://power.larc.nasa.gov/api/temporal/hourly/point"
+        f"?parameters={parameter}&community=RE"
+        f"&longitude={lon}&latitude={lat}&format=JSON"
+        f"&start={start_date}&end={end_date}"
     )
-    response = requests.get(url)
-    if response.status_code != 200:
-        return None
-    data = response.json()
-    records = data["properties"]["parameter"][parameter]
-    df = pd.DataFrame.from_dict(records, orient="index", columns=[parameter])
-    df.index = pd.to_datetime(df.index)
-    df.reset_index(inplace=True)
-    df.rename(columns={"index": "datetime"}, inplace=True)
-    return df
+    try:
+        response = requests.get(url)
+        data = response.json()
 
-# ---------- تحميل البيانات عند الضغط ----------
-if st.button("📥 Get Data"):
-    df = fetch_weather_data(lat, lon, start_date, end_date, selected_param)
-    if df is not None and not df.empty:
-        st.success(f"تم تحميل البيانات ({len(df)} صف)")
-        st.line_chart(df.set_index("datetime")[selected_param])
-        st.download_button("📤 Download CSV", data=df.to_csv(index=False), file_name="weather_data.csv")
-    else:
-        st.error("⚠️ لم يتم تحميل البيانات، تأكد من التاريخ أو أعد المحاولة.")
+        if 'properties' not in data or 'parameter' not in data['properties']:
+            return pd.DataFrame()  # empty dataframe
+
+        hourly_data = data['properties']['parameter'][parameter]
+        df = pd.DataFrame.from_dict(hourly_data, orient='index', columns=[parameter])
+        df.index.name = 'datetime'
+        df.reset_index(inplace=True)
+        df['datetime'] = pd.to_datetime(df['datetime'], format="%Y%m%d%H")
+        return df
+    except Exception as e:
+        st.error(f"API error: {e}")
+        return pd.DataFrame()
+
+# ------------------------------
+# App UI
+# ------------------------------
+st.set_page_config(page_title="NASA Weather Dashboard", layout="wide")
+st.title("NASA Weather Dashboard")
+st.markdown("Compare hourly weather data from multiple stations using NASA POWER API")
+
+# Tabs
+tabs = st.tabs(["📊 Time Series", "📈 Intra-Day", "📅 Intra-Month", "🗺️ Map"])
+
+with tabs[0]:  # Time Series
+    selected_stations = st.multiselect("Select Stations", stations_df["Station Name"].tolist(), default=["Riyadh"])
+    selected_param = st.selectbox("Select Parameter", ["T2M", "RH2M", "WS10M"])
+    
+    today = datetime.today()
+    start_date = st.date_input("Start Date", value=datetime(2016, 1, 1), min_value=datetime(2005, 1, 1))
+    end_date = st.date_input("End Date", value=today - timedelta(days=3), max_value=today - timedelta(days=1))
+
+    if st.button("Get Data"):
+        fig = px.line()
+        for station in selected_stations:
+            row = stations_df[stations_df["Station Name"] == station].iloc[0]
+            df = fetch_hourly_weather_data(
+                row["Latitude"], row["Longitude"],
+                start_date.strftime("%Y%m%d"),
+                end_date.strftime("%Y%m%d"),
+                selected_param
+            )
+            if not df.empty:
+                df["station"] = station
+                fig.add_scatter(x=df["datetime"], y=df[selected_param], mode='lines', name=station)
+            else:
+                st.warning(f"No data found for {station}")
+        st.plotly_chart(fig, use_container_width=True)
