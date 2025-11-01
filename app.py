@@ -1,113 +1,116 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+import requests
+import datetime as dt
+from io import StringIO
 import plotly.express as px
-import pytz
-from datetime import datetime, timedelta
-from utils import fetch_hourly_weather_data, calculate_cdd_hdd, load_stations
-import os
 
-st.set_page_config(layout="wide")
+# ---------------------- الإعدادات العامة ---------------------- #
+st.set_page_config(page_title="NASA Weather Dashboard", layout="wide")
+st.title("🌤 NASA Weather Dashboard")
+st.write("Compare hourly weather data from multiple stations using NASA POWER API")
 
-# -------------------------------------
-# Load station data
-# -------------------------------------
-stations_df = load_stations("stations.xlsx")
-stations_dict = dict(zip(stations_df["Station Name"], zip(stations_df["Latitude"], stations_df["Longitude"])))
-
-# -------------------------------------
-# Sidebar
-# -------------------------------------
-st.sidebar.title("Weather Data Explorer")
-stations_selected = st.sidebar.multiselect("Select Stations", list(stations_dict.keys()), default=list(stations_dict.keys())[:1])
-
-parameters = {
-    "T2M": "Air Temperature at 2m (°C)",
-    "RH2M": "Relative Humidity at 2m (%)",
-    "WS2M": "Wind Speed at 2m (m/s)",
-    "PRECTOTCORR": "Precipitation (mm/hr)"
+# ---------------------- إعدادات الإدخال ---------------------- #
+stations = {
+    "Riyadh": (24.7136, 46.6753),
+    "Jeddah": (21.4858, 39.1925),
+    "Dammam": (26.4207, 50.0888),
+    "Makkah": (21.3891, 39.8579),
+    "Madinah": (24.5247, 39.5692),
+    "Turaif": (31.6729, 38.6636),
 }
 
-parameter_selected = st.sidebar.selectbox("Select Parameter", list(parameters.keys()), format_func=lambda x: parameters[x])
+parameters = {
+    "T2M": "Air Temperature at 2 Meters (°C)",
+    "RH2M": "Relative Humidity at 2 Meters (%)",
+    "WS2M": "Wind Speed at 2 Meters (m/s)",
+}
 
-# NASA supports data from 2001-01-01 to ~3 days before today
-min_date = datetime(2001, 1, 1)
-max_date = datetime.utcnow() - timedelta(days=3)
+# ---------------------- دوال الأدوات ---------------------- #
+def fetch_hourly_weather_data(lat, lon, start_date, end_date, parameter):
+    url = (
+        f"https://power.larc.nasa.gov/api/temporal/hourly/point"
+        f"?start={start_date}&end={end_date}&latitude={lat}&longitude={lon}"
+        f"&parameters={parameter}&community=RE&format=CSV"
+    )
 
-start_date = st.sidebar.date_input("Start Date", min_value=min_date, max_value=max_date, value=max_date - timedelta(days=365))
-end_date = st.sidebar.date_input("End Date", min_value=min_date, max_value=max_date, value=max_date)
+    response = requests.get(url)
+    if response.status_code != 200:
+        st.error(f"API request failed: {response.status_code}")
+        return pd.DataFrame()
 
-# -------------------------------------
-# Title and Tabs
-# -------------------------------------
-st.markdown("""
-    <h1 style='text-align: center; font-size: 36px;'>NASA Weather Dashboard</h1>
-    <p style='text-align: center; color: gray;'>Compare hourly weather data from multiple stations using NASA POWER API</p>
-    <hr>
-""", unsafe_allow_html=True)
+    raw_data = StringIO(response.text)
+    df = pd.read_csv(raw_data, skiprows=10)
 
-# Tabs
-view = st.tabs(["📈 Time Series", "📉 Intra-Day", "📊 Intra-Month", "🗺️ Map"])
+    df = df.rename(columns={"YEAR": "year", "MO": "month", "DY": "day", "HR": "hour", parameter: "value"})
+    df["datetime"] = pd.to_datetime(
+        df[["year", "month", "day", "hour"]], errors="coerce"
+    )
+    df = df.dropna(subset=["datetime"])
+    df = df[["datetime", "value"]]
+    return df
 
-# -------------------------------------
-# Fetch and process data
-# -------------------------------------
-if st.sidebar.button("Get Data"):
-    all_data = []
-    for station in stations_selected:
-        lat, lon = stations_dict[station]
-        df = fetch_hourly_weather_data(lat, lon, start_date, end_date, parameter_selected)
-        if df is not None and not df.empty:
-            df["station"] = station
-            all_data.append(df)
+def calculate_cdd_hdd(df, base_temp=18.0):
+    df["CDD"] = (df["value"] - base_temp).clip(lower=0)
+    df["HDD"] = (base_temp - df["value"]).clip(lower=0)
+    return df
 
-    if not all_data:
-        st.warning("No data returned for the selected parameters and stations.")
-    else:
-        weather_df = pd.concat(all_data)
+# ---------------------- واجهة المستخدم ---------------------- #
+st.sidebar.header("Select Stations")
+selected_stations = st.sidebar.multiselect("Select Stations", options=stations.keys(), default=["Riyadh"])
 
-        # Convert to Saudi local time (UTC+3)
-        sa_tz = pytz.timezone("Asia/Riyadh")
-        weather_df["datetime"] = pd.to_datetime(weather_df["datetime"])
-        weather_df["datetime"] = weather_df["datetime"].dt.tz_localize("UTC").dt.tz_convert(sa_tz)
+st.sidebar.header("Select Parameter")
+selected_param = st.sidebar.selectbox("Select Parameter", options=list(parameters.keys()), index=0)
 
-        # Time Series Tab
-        with view[0]:
-            fig = px.line(weather_df, x="datetime", y=parameter_selected, color="station", title="Hourly Time Series")
-            st.plotly_chart(fig, use_container_width=True)
-            st.download_button("📥 Download Data as CSV", weather_df.to_csv(index=False), file_name=f"weather_data_{datetime.now().strftime('%Y%m%d_%H%M')}.csv")
+min_date = dt.date(2005, 10, 1)
+max_date = dt.date(2035, 10, 1)
 
-        # Intra-Day Tab
-        with view[1]:
-            weather_df["hour"] = weather_df["datetime"].dt.hour
-            intra_day = weather_df.groupby(["station", "hour"])[parameter_selected].mean().reset_index()
-            fig_day = px.line(intra_day, x="hour", y=parameter_selected, color="station", markers=True, title="Intra-Day Average")
-            st.plotly_chart(fig_day, use_container_width=True)
+start_date = st.sidebar.date_input("Start Date", min_value=min_date, max_value=max_date, value=min_date)
+end_date = st.sidebar.date_input("End Date", min_value=min_date, max_value=max_date, value=dt.date(2025, 10, 29))
 
-        # Intra-Month Tab
-        with view[2]:
-            weather_df["day"] = weather_df["datetime"].dt.day
-            weather_df["month"] = weather_df["datetime"].dt.month
-            monthly_stats = weather_df.groupby(["station", "month", "day"])[parameter_selected].mean().reset_index()
-            fig_month = px.line(monthly_stats, x="day", y=parameter_selected, color="station", facet_col="month", facet_col_wrap=4,
-                                title="Intra-Month Daily Averages")
-            st.plotly_chart(fig_month, use_container_width=True)
-
-        # Map Tab
-        with view[3]:
-            station_plot_df = stations_df[stations_df["Station Name"].isin(stations_selected)]
-            fig_map = px.scatter_mapbox(station_plot_df, lat="Latitude", lon="Longitude", hover_name="Station Name",
-                                        zoom=4, height=500)
-            fig_map.update_layout(mapbox_style="open-street-map")
-            st.plotly_chart(fig_map, use_container_width=True)
-
-        # CDD and HDD
-        cdd_hdd_df = calculate_cdd_hdd(weather_df, temp_column=parameter_selected)
-        st.markdown("### Cooling & Heating Degree Days")
-        st.dataframe(cdd_hdd_df)
-
+if start_date > end_date:
+    st.sidebar.error("Start date must be before end date.")
 else:
-    st.info("Please select stations, parameter and date range then click 'Get Data'.")
+    if st.sidebar.button("Get Data"):
+        all_data = []
+        for station in selected_stations:
+            lat, lon = stations[station]
+            df = fetch_hourly_weather_data(
+                lat,
+                lon,
+                start_date.strftime("%Y%m%d"),
+                end_date.strftime("%Y%m%d"),
+                selected_param,
+            )
+            if not df.empty:
+                df["station"] = station
+                df = calculate_cdd_hdd(df)
+                all_data.append(df)
+
+        if all_data:
+            combined_df = pd.concat(all_data)
+            st.subheader("📈 Hourly Time Series")
+            fig = px.line(combined_df, x="datetime", y="value", color="station", title=parameters[selected_param])
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.download_button("⬇️ Download Data as CSV", combined_df.to_csv(index=False), file_name="weather_data.csv")
+
+            # Optional: CDD/HDD plotting
+            if "CDD" in combined_df.columns:
+                st.subheader("Cooling Degree Days (CDD)")
+                fig_cdd = px.line(combined_df, x="datetime", y="CDD", color="station")
+                st.plotly_chart(fig_cdd, use_container_width=True)
+
+                st.subheader("Heating Degree Days (HDD)")
+                fig_hdd = px.line(combined_df, x="datetime", y="HDD", color="station")
+                st.plotly_chart(fig_hdd, use_container_width=True)
+        else:
+            st.warning("No data retrieved. Please try different parameters or date ranges.")
+
+
+
+
+
 
 
 
