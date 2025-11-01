@@ -1,111 +1,154 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from datetime import datetime, timedelta
-from io import BytesIO
 import requests
+import io
+from datetime import datetime, timedelta
+import pytz
 
-st.set_page_config(page_title="NASA POWER - Climate Data Dashboard", layout="wide")
+# === Constants ===
+TIMEZONE = 'Asia/Riyadh'
+KSA_TZ = pytz.timezone(TIMEZONE)
+NASA_BASE_URL = "https://power.larc.nasa.gov/api/temporal/hourly/point"
+PARAMETERS = ["T2M", "T2M_MAX", "T2M_MIN", "RH2M", "PRECTOTCORR", "WS10M"]
 
+# === Utility Functions ===
 @st.cache_data
-def load_stations():
+def load_station_data():
     df = pd.read_excel("stations.xlsx")
-    df = df.rename(columns=lambda x: x.strip())
+    df.columns = df.columns.str.strip()
     return df
 
-def fetch_hourly_weather_data(lat, lon, start_date, end_date, parameter):
-    base_url = "https://power.larc.nasa.gov/api/temporal/hourly/point"
-    params = {
-        "parameters": parameter,
-        "community": "ag",
-        "longitude": lon,
-        "latitude": lat,
-        "start": start_date.strftime('%Y%m%d'),
-        "end": end_date.strftime('%Y%m%d'),
-        "format": "JSON"
-    }
-    response = requests.get(base_url, params=params)
-    if response.status_code == 200:
-        data = response.json()
-        records = data["properties"]["parameter"][parameter]
-        df = pd.DataFrame.from_dict(records, orient="index", columns=[parameter])
-        df.index = pd.to_datetime(df.index)
-        df = df.reset_index().rename(columns={"index": "datetime"})
-        df["year"] = df["datetime"].dt.year
-        df["month"] = df["datetime"].dt.month
-        df["day"] = df["datetime"].dt.day
-        df["hour"] = df["datetime"].dt.hour
-        return df
-    else:
-        return pd.DataFrame()
+@st.cache_data
+def fetch_hourly_weather_data(lat, lon, start, end, parameter):
+    url = (
+        f"{NASA_BASE_URL}?parameters={parameter}"
+        f"&community=RE&latitude={lat}&longitude={lon}"
+        f"&start={start}&end={end}&format=JSON&time-standard=UTC"
+    )
+    while True:
+        try:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            raw = response.json()
+            data = raw["properties"]["parameter"][parameter]
+            df = pd.DataFrame.from_dict(data, orient="index", columns=[parameter])
+            df.index = pd.to_datetime(df.index, format="%Y%m%d%H").tz_localize("UTC").tz_convert(KSA_TZ)
+            return df
+        except Exception as e:
+            st.warning(f"Retrying due to error: {e}")
+            continue
 
-def calculate_cdd_hdd(df, base_temp=18.0):
-    df["date"] = df["datetime"].dt.date
-    daily_avg = df.groupby("date")["T2M"].mean().reset_index()
-    daily_avg["CDD"] = np.maximum(daily_avg["T2M"] - base_temp, 0)
-    daily_avg["HDD"] = np.maximum(base_temp - daily_avg["T2M"], 0)
-    daily_avg["year"] = pd.to_datetime(daily_avg["date"]).dt.year
-    daily_avg["day_of_year"] = pd.to_datetime(daily_avg["date"]).dt.dayofyear
-    return daily_avg
+def compute_cdd_hdd(df, base_temp=18.0):
+    cdd = df["T2M"].apply(lambda x: max(0, x - base_temp))
+    hdd = df["T2M"].apply(lambda x: max(0, base_temp - x))
+    result = pd.DataFrame({"CDD": cdd, "HDD": hdd})
+    result["Date"] = result.index.date
+    return result.groupby("Date").sum()
 
-stations_df = load_stations()
-station_names = stations_df["Station Name"].tolist()
+# === UI ===
+st.set_page_config(layout="wide", page_title="KSA Climate Dashboard")
+st.title("Saudi Arabia Weather Analytics")
+station_data = load_station_data()
 
-st.sidebar.header("🛠️ Filters")
-selected_stations = st.sidebar.multiselect("Choose Stations", station_names, default=["Riyadh"])
-parameters_dict = {"T2M": "Temperature at 2m (°C)", "WS2M": "Wind Speed at 2m (m/s)", "RH2M": "Relative Humidity at 2m (%)"}
-selected_params = st.sidebar.multiselect("Select Parameters", options=list(parameters_dict.keys()), default=["T2M"])
-start_date = st.sidebar.date_input("Start Date", datetime(2023, 1, 1))
-end_date = st.sidebar.date_input("End Date", datetime(2025, 10, 1))
+with st.sidebar:
+    st.header("Configuration")
+    selected_stations = st.multiselect("Select Stations", options=station_data["Station Name"], default=station_data["Station Name"].iloc[0:1])
+    parameters = st.multiselect("Select Parameters", options=PARAMETERS, default=["T2M"])
+    end_date = datetime.now(KSA_TZ) - timedelta(days=3)
+    start_date = st.date_input("Start Date", end_date - timedelta(days=30))
+    end_date = st.date_input("End Date", end_date.date())
 
-if start_date > end_date:
-    st.sidebar.error("End Date must be after Start Date.")
-
-st.sidebar.button("🚀 Load & Analyze")
-
-tabs = ["📊 Overview", "📈 Daily Max/Mean/Min", "📅 Yearly Comparison", "🔥 CDD/HDD Analysis", "🌤️ Peak & Seasons"]
-selected_tab = st.sidebar.radio("Navigate", tabs, index=0)
-
-@st.cache_data(show_spinner=False)
+# === Data Loading ===
+@st.cache_data
 def load_all_data():
-    all_data = {}
+    results = {}
+    start = pd.to_datetime(start_date).strftime("%Y%m%d")
+    end = pd.to_datetime(end_date).strftime("%Y%m%d")
     for station in selected_stations:
-        lat = stations_df[stations_df["Station Name"] == station]["Latitude"].values[0]
-        lon = stations_df[stations_df["Station Name"] == station]["Longitude"].values[0]
-        for param in selected_params:
-            df = fetch_hourly_weather_data(lat, lon, start_date, end_date, param)
-            if not df.empty:
-                all_data[(station, param)] = df
-    return all_data
+        row = station_data[station_data["Station Name"] == station].iloc[0]
+        station_results = {}
+        for param in parameters:
+            df = fetch_hourly_weather_data(row["Latitude"], row["Longitude"], start, end, param)
+            station_results[param] = df
+        results[station] = station_results
+    return results
 
 data_cache = load_all_data()
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Overview", "Intra Day/Month", "Yearly Max Trends", "CDD/HDD Analysis", "Daily Year Comparison"])
 
-def show_peak_and_season_tab():
-    st.header("🌤️ Peak Daily & Seasonal Analysis")
-    for (station, param), df in data_cache.items():
-        st.subheader(f"📍 {station} - {parameters_dict.get(param, param)}")
+# === Overview Tab ===
+with tab1:
+    st.subheader("Stations Map")
+    station_map = station_data[station_data["Station Name"].isin(selected_stations)]
+    fig_map = px.scatter_mapbox(
+        station_map,
+        lat="Latitude",
+        lon="Longitude",
+        hover_name="Station Name",
+        zoom=4,
+        height=500
+    )
+    fig_map.update_layout(mapbox_style="carto-positron", margin={"r":0,"t":0,"l":0,"b":0})
+    st.plotly_chart(fig_map, use_container_width=True)
 
-        df["day_of_year"] = df["datetime"].dt.dayofyear
-        df["year"] = df["datetime"].dt.year
+# === Intra Day/Month Tab ===
+with tab2:
+    st.subheader("Intra Day and Intra Month Analysis")
+    for station in selected_stations:
+        for param in parameters:
+            df = data_cache[station][param].copy()
+            df["Hour"] = df.index.hour
+            df["Day"] = df.index.day
+            df["Month"] = df.index.month
 
-        daily_max = df.groupby(["year", "day_of_year"])[param].max().reset_index()
-        fig = px.line(daily_max, x="day_of_year", y=param, color="year", title=f"Peak Daily {param} Across Years")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown(f"**Hourly Distribution** for {param} - {station}")
+                st.plotly_chart(px.box(df, x="Hour", y=param, title="Hourly Distribution"), use_container_width=True)
+            with col2:
+                st.markdown(f"**Monthly Distribution** for {param} - {station}")
+                st.plotly_chart(px.box(df, x="Month", y=param, title="Monthly Distribution"), use_container_width=True)
+
+# === Yearly Max Trends Tab ===
+with tab3:
+    st.subheader("Daily Max Temperature Trends Across Years")
+    for station in selected_stations:
+        df = data_cache[station]["T2M"].copy()
+        df = df.resample("D").max()
+        df["Year"] = df.index.year
+        df["DOY"] = df.index.dayofyear
+        fig = px.line(df, x="DOY", y="T2M", color="Year", title=f"Max T2M Trends - {station}")
         st.plotly_chart(fig, use_container_width=True)
 
-        df["season"] = df["datetime"].dt.month % 12 // 3 + 1
-        season_map = {1: "Winter", 2: "Spring", 3: "Summer", 4: "Fall"}
-        df["season_name"] = df["season"].map(season_map)
-        seasonal_avg = df.groupby(["year", "season_name"])[param].mean().reset_index()
-        fig_season = px.bar(seasonal_avg, x="season_name", y=param, color="year", barmode="group",
-                            title=f"Seasonal Average of {param} - {station}")
-        st.plotly_chart(fig_season, use_container_width=True)
+# === CDD/HDD Analysis Tab ===
+with tab4:
+    st.subheader("Cooling and Heating Degree Days")
+    for station in selected_stations:
+        df = data_cache[station]["T2M"].copy()
+        result = compute_cdd_hdd(pd.DataFrame({"T2M": df}))
+        result["Year"] = pd.to_datetime(result.index).year
+        result["DOY"] = pd.to_datetime(result.index).dayofyear
 
-def show_tab(tab):
-    if tab == "🌤️ Peak & Seasons":
-        show_peak_and_season_tab()
-    else:
-        st.info("Other tabs' functionality can be implemented here.")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(f"**Daily CDD** - {station}")
+            fig1 = px.line(result, x="DOY", y="CDD", color="Year", title="Cooling Degree Days")
+            st.plotly_chart(fig1, use_container_width=True)
+        with col2:
+            st.markdown(f"**Daily HDD** - {station}")
+            fig2 = px.line(result, x="DOY", y="HDD", color="Year", title="Heating Degree Days")
+            st.plotly_chart(fig2, use_container_width=True)
 
-show_tab(selected_tab)
+# === Daily Year Comparison Tab ===
+with tab5:
+    st.subheader("Daily Comparison Across Years")
+    for station in selected_stations:
+        for param in parameters:
+            df = data_cache[station][param].copy()
+            df = df.resample("D").mean()
+            df["Year"] = df.index.year
+            df["DOY"] = df.index.dayofyear
+            fig = px.line(df, x="DOY", y=param, color="Year", title=f"{param} Daily Mean Comparison - {station}")
+            st.plotly_chart(fig, use_container_width=True)
