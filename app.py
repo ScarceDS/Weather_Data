@@ -1,97 +1,90 @@
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
-import datetime
-import requests
+from datetime import datetime
 import calendar
-from io import StringIO
-import pytz
-
-st.set_page_config(layout="wide", page_title="NASA POWER Climate Dashboard")
-
-st.title("🌍 NASA POWER - Climate Data Dashboard")
-st.markdown("Compare weather parameters across multiple Saudi stations using NASA hourly data.")
 
 @st.cache_data
 def load_stations():
-    return pd.read_excel("stations.xlsx")
+    df = pd.read_excel("stations.xlsx")
+    return df[['Station Name', 'Latitude', 'Longitude']]
 
+def fetch_nasa_data(lat, lon, start_date, end_date, parameter):
+    url = f"https://power.larc.nasa.gov/api/temporal/hourly/point?parameters={parameter}&community=SB&longitude={lon}&latitude={lat}&start={start_date}&end={end_date}&format=JSON"
+    try:
+        df = pd.read_json(url)
+        records = df['properties']['parameter'][parameter]
+        df = pd.DataFrame(records).T
+        df.index = pd.to_datetime(df.index)
+        df.columns = [parameter]
+        return df
+    except:
+        return pd.DataFrame()
+
+def calculate_daily_stats(df, param):
+    daily = df.resample('D').agg(['min', 'max', 'mean']).reset_index()
+    daily.columns = ['date', 'Min', 'Max', 'Mean']
+    daily['year'] = daily['date'].dt.year
+    daily['dayofyear'] = daily['date'].dt.dayofyear
+    return daily
+
+def calculate_cdd_hdd(df, base_temp=18.3):
+    daily = df.resample('D').mean().reset_index()
+    daily['CDD'] = np.maximum(daily.iloc[:, 1] - base_temp, 0)
+    daily['HDD'] = np.maximum(base_temp - daily.iloc[:, 1], 0)
+    daily['year'] = daily['date'].dt.year
+    daily['dayofyear'] = daily['date'].dt.dayofyear
+    return daily
+
+def plot_year_comparison(df, value_column, title):
+    fig = px.line(df, x='dayofyear', y=value_column, color='year', markers=False, title=title)
+    fig.update_layout(xaxis_title="Day of Year", yaxis_title=value_column)
+    return fig
+
+st.set_page_config(layout="wide")
+st.sidebar.title("🛠 Filters")
 stations_df = load_stations()
-station_names = stations_df["Station Name"].tolist()
-param_options = {
-    "Temperature at 2m (°C)": "T2M",
-    "Relative Humidity at 2m (%)": "RH2M",
-    "Wind Speed at 10m (m/s)": "WS10M"
-}
-default_params = ["T2M"]
-default_year = datetime.date.today().year - 1
 
-st.sidebar.header("🔧 Filters")
-selected_stations = st.sidebar.multiselect("Choose Stations", station_names, default=[station_names[0]])
-selected_params = st.sidebar.multiselect("Select Parameters", list(param_options.keys()), default=param_options.keys())
-start_date = st.sidebar.date_input("Start Date", datetime.date(default_year, 1, 1))
-end_date = st.sidebar.date_input("End Date", datetime.date.today() - datetime.timedelta(days=3))
+station_names = st.sidebar.multiselect("Choose Stations", stations_df['Station Name'].tolist())
+parameters = st.sidebar.multiselect("Select Parameters", ['T2M', 'RH2M', 'WS2M', 'PRECTOTCORR', 'ALLSKY_SFC_SW_DWN'])
+start_date = st.sidebar.date_input("Start Date", datetime(2023, 1, 1))
+end_date = st.sidebar.date_input("End Date", datetime(2025, 10, 29))
+st.sidebar.button("🚀 Load & Analyze")
 
-tz_ksa = pytz.timezone("Asia/Riyadh")
+page = st.sidebar.radio("Navigate", ["📊 Overview", "📈 Daily Max/Mean/Min", "📅 Yearly Comparison", "🔥 CDD/HDD Analysis"])
 
-@st.cache_data
-def get_data(lat, lon, start, end, param):
-    url = f"https://power.larc.nasa.gov/api/temporal/hourly/point"
-    params = {
-        "parameters": param,
-        "community": "RE",
-        "longitude": lon,
-        "latitude": lat,
-        "start": start.strftime("%Y%m%d"),
-        "end": end.strftime("%Y%m%d"),
-        "format": "CSV",
-        "time-standard": "UTC"
-    }
-    for _ in range(10):
-        try:
-            res = requests.get(url, params=params, timeout=60)
-            if res.status_code == 200:
-                df = pd.read_csv(StringIO(res.text), skiprows=10)
-                df["datetime"] = pd.to_datetime(df["YEAR"].astype(str) + df["MO"].astype(str).str.zfill(2) +
-                                                df["DY"].astype(str).str.zfill(2) + df["HR"].astype(str).str.zfill(2),
-                                                format="%Y%m%d%H", utc=True).dt.tz_convert(tz_ksa)
-                return df.set_index("datetime")
-        except:
-            continue
-    return None
+if station_names and parameters:
+    for station in station_names:
+        lat = stations_df.loc[stations_df['Station Name'] == station, 'Latitude'].values[0]
+        lon = stations_df.loc[stations_df['Station Name'] == station, 'Longitude'].values[0]
 
-if st.sidebar.button("🚀 Load & Analyze"):
-    st.header("📈 Multi-station Parameter Analysis")
-    for param_name in selected_params:
-        param_code = param_options[param_name]
-        st.subheader(f"🌀 {param_name}")
-        fig = px.line()
-        all_series = []
-        for station in selected_stations:
-            row = stations_df[stations_df["Station Name"] == station].iloc[0]
-            df = get_data(row["Latitude"], row["Longitude"], start_date, end_date, param_code)
-            if df is not None:
-                df = df[[param_code]]
-                df.columns = [f"{station}"]
-                all_series.append(df)
-                df_daily = df.resample("D").agg(["mean", "max", "min"]).droplevel(1, axis=1)
-                df_daily["DOY"] = df_daily.index.dayofyear
-                df_daily["Year"] = df_daily.index.year
-                fig.add_scatter(x=df_daily.index, y=df_daily[station], mode="lines", name=station)
-        st.plotly_chart(fig, use_container_width=True)
+        for param in parameters:
+            df = fetch_nasa_data(lat, lon, start_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"), param)
+            if df.empty:
+                st.warning(f"No data available for {station} - {param}")
+                continue
 
-        # Day-of-Year Comparison
-        if all_series:
-            st.markdown("#### 📅 Day-of-Year Comparison")
-            df_concat = pd.concat(all_series, axis=1)
-            df_concat["DOY"] = df_concat.index.dayofyear
-            df_concat["Year"] = df_concat.index.year
-            for station in df_concat.columns[:-2]:
-                fig2 = px.line(df_concat, x="DOY", y=station, color="Year", title=f"{station} - DOY Comparison")
-                st.plotly_chart(fig2, use_container_width=True)
+            if page == "📊 Overview":
+                st.header(f"{station} - {param}")
+                st.line_chart(df)
 
-    # Optional: Export data section or advanced tabs (if required)
+            elif page == "📈 Daily Max/Mean/Min":
+                daily = calculate_daily_stats(df, param)
+                fig = plot_year_comparison(daily, 'Max', f"{station} - Daily Max Temp")
+                st.plotly_chart(fig, use_container_width=True)
 
+            elif page == "📅 Yearly Comparison":
+                daily = calculate_daily_stats(df, param)
+                for col in ['Min', 'Max', 'Mean']:
+                    fig = plot_year_comparison(daily, col, f"{station} - Daily {col}")
+                    st.plotly_chart(fig, use_container_width=True)
+
+            elif page == "🔥 CDD/HDD Analysis":
+                daily = calculate_cdd_hdd(df)
+                for col in ['CDD', 'HDD']:
+                    fig = plot_year_comparison(daily, col, f"{station} - Daily {col}")
+                    st.plotly_chart(fig, use_container_width=True)
 else:
-    st.info("👈 Choose filters and click 'Load & Analyze' to begin.")
+    st.info("Please select at least one station and one parameter to begin analysis.")
