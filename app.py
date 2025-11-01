@@ -1,124 +1,97 @@
+
 import streamlit as st
 import pandas as pd
-import requests
-from datetime import datetime, timedelta
 import plotly.express as px
+import datetime
+import requests
+import calendar
+from io import StringIO
+import pytz
 
-# ------------------------------
-# Load station list from Excel
-# ------------------------------
+st.set_page_config(layout="wide", page_title="NASA POWER Climate Dashboard")
+
+st.title("🌍 NASA POWER - Climate Data Dashboard")
+st.markdown("Compare weather parameters across multiple Saudi stations using NASA hourly data.")
+
 @st.cache_data
 def load_stations():
-    df = pd.read_excel("stations.xlsx")
-    return df[['Station Name', 'Latitude', 'Longitude']]
+    return pd.read_excel("stations.xlsx")
 
 stations_df = load_stations()
+station_names = stations_df["Station Name"].tolist()
+param_options = {
+    "Temperature at 2m (°C)": "T2M",
+    "Relative Humidity at 2m (%)": "RH2M",
+    "Wind Speed at 10m (m/s)": "WS10M"
+}
+default_params = ["T2M"]
+default_year = datetime.date.today().year - 1
 
-# ------------------------------
-# Fetch hourly weather data
-# ------------------------------
-def fetch_hourly_weather_data(lat, lon, start_date, end_date, parameter):
-    url = (
-        f"https://power.larc.nasa.gov/api/temporal/hourly/point"
-        f"?parameters={parameter}&community=RE"
-        f"&longitude={lon}&latitude={lat}&format=JSON"
-        f"&start={start_date}&end={end_date}"
-    )
-    try:
-        response = requests.get(url)
-        data = response.json()
+st.sidebar.header("🔧 Filters")
+selected_stations = st.sidebar.multiselect("Choose Stations", station_names, default=[station_names[0]])
+selected_params = st.sidebar.multiselect("Select Parameters", list(param_options.keys()), default=param_options.keys())
+start_date = st.sidebar.date_input("Start Date", datetime.date(default_year, 1, 1))
+end_date = st.sidebar.date_input("End Date", datetime.date.today() - datetime.timedelta(days=3))
 
-        if 'properties' not in data or 'parameter' not in data['properties']:
-            return pd.DataFrame()
+tz_ksa = pytz.timezone("Asia/Riyadh")
 
-        hourly_data = data['properties']['parameter'][parameter]
-        df = pd.DataFrame.from_dict(hourly_data, orient='index', columns=[parameter])
-        df.index.name = 'datetime'
-        df.reset_index(inplace=True)
-        df['datetime'] = pd.to_datetime(df['datetime'], format="%Y%m%d%H")
-        return df
-    except Exception as e:
-        st.error(f"API error: {e}")
-        return pd.DataFrame()
+@st.cache_data
+def get_data(lat, lon, start, end, param):
+    url = f"https://power.larc.nasa.gov/api/temporal/hourly/point"
+    params = {
+        "parameters": param,
+        "community": "RE",
+        "longitude": lon,
+        "latitude": lat,
+        "start": start.strftime("%Y%m%d"),
+        "end": end.strftime("%Y%m%d"),
+        "format": "CSV",
+        "time-standard": "UTC"
+    }
+    for _ in range(10):
+        try:
+            res = requests.get(url, params=params, timeout=60)
+            if res.status_code == 200:
+                df = pd.read_csv(StringIO(res.text), skiprows=10)
+                df["datetime"] = pd.to_datetime(df["YEAR"].astype(str) + df["MO"].astype(str).str.zfill(2) +
+                                                df["DY"].astype(str).str.zfill(2) + df["HR"].astype(str).str.zfill(2),
+                                                format="%Y%m%d%H", utc=True).dt.tz_convert(tz_ksa)
+                return df.set_index("datetime")
+        except:
+            continue
+    return None
 
-# ------------------------------
-# Streamlit Layout
-# ------------------------------
-st.set_page_config(page_title="NASA Weather Dashboard", layout="wide")
-st.title("NASA Weather Dashboard")
-st.markdown("Compare hourly weather data from multiple stations using NASA POWER API")
-
-# ------------------------------
-# Sidebar Inputs
-# ------------------------------
-with st.sidebar:
-    st.header("Station Settings")
-    selected_stations = st.multiselect("Select Stations", stations_df["Station Name"].tolist(), default=["Riyadh"])
-    selected_param = st.selectbox("Select Parameter", ["T2M", "RH2M", "WS10M"])
-
-    today = datetime.today()
-    start_date = st.date_input("Start Date", value=datetime(2016, 1, 1), min_value=datetime(2005, 1, 1))
-    end_date = st.date_input("End Date", value=today - timedelta(days=3), max_value=today - timedelta(days=1))
-
-    load_btn = st.button("📥 Load & Analyze Data")
-
-# ------------------------------
-# Main View
-# ------------------------------
-if load_btn:
-    tab1, tab2 = st.tabs(["📊 Time Series", "📈 Max Daily Temp per Year"])
-
-    # -------- Time Series Tab --------
-    with tab1:
+if st.sidebar.button("🚀 Load & Analyze"):
+    st.header("📈 Multi-station Parameter Analysis")
+    for param_name in selected_params:
+        param_code = param_options[param_name]
+        st.subheader(f"🌀 {param_name}")
         fig = px.line()
+        all_series = []
         for station in selected_stations:
             row = stations_df[stations_df["Station Name"] == station].iloc[0]
-            df = fetch_hourly_weather_data(
-                row["Latitude"], row["Longitude"],
-                start_date.strftime("%Y%m%d"),
-                end_date.strftime("%Y%m%d"),
-                selected_param
-            )
-            if not df.empty:
-                df["station"] = station
-                fig.add_scatter(x=df["datetime"], y=df[selected_param], mode='lines', name=station)
-            else:
-                st.warning(f"No data found for {station}")
-        st.subheader("📈 Hourly Time Series")
+            df = get_data(row["Latitude"], row["Longitude"], start_date, end_date, param_code)
+            if df is not None:
+                df = df[[param_code]]
+                df.columns = [f"{station}"]
+                all_series.append(df)
+                df_daily = df.resample("D").agg(["mean", "max", "min"]).droplevel(1, axis=1)
+                df_daily["DOY"] = df_daily.index.dayofyear
+                df_daily["Year"] = df_daily.index.year
+                fig.add_scatter(x=df_daily.index, y=df_daily[station], mode="lines", name=station)
         st.plotly_chart(fig, use_container_width=True)
 
-    # -------- Daily Max Tab --------
-    with tab2:
-        st.subheader("📊 Max Daily Temperature Comparison")
-        daily_df_list = []
+        # Day-of-Year Comparison
+        if all_series:
+            st.markdown("#### 📅 Day-of-Year Comparison")
+            df_concat = pd.concat(all_series, axis=1)
+            df_concat["DOY"] = df_concat.index.dayofyear
+            df_concat["Year"] = df_concat.index.year
+            for station in df_concat.columns[:-2]:
+                fig2 = px.line(df_concat, x="DOY", y=station, color="Year", title=f"{station} - DOY Comparison")
+                st.plotly_chart(fig2, use_container_width=True)
 
-        for station in selected_stations:
-            row = stations_df[stations_df["Station Name"] == station].iloc[0]
-            df = fetch_hourly_weather_data(
-                row["Latitude"], row["Longitude"],
-                start_date.strftime("%Y%m%d"),
-                end_date.strftime("%Y%m%d"),
-                "T2M"
-            )
-            if not df.empty:
-                df["date"] = df["datetime"].dt.date
-                daily_max = df.groupby("date")["T2M"].max().reset_index()
-                daily_max["year"] = pd.to_datetime(daily_max["date"]).dt.year
-                daily_max["station"] = station
-                daily_df_list.append(daily_max)
+    # Optional: Export data section or advanced tabs (if required)
 
-        if daily_df_list:
-            merged = pd.concat(daily_df_list)
-            fig2 = px.line(
-                merged,
-                x="date",
-                y="T2M",
-                color="year",
-                line_group="station",
-                facet_row="station",
-                title="Max Daily Temperature by Year",
-                labels={"T2M": "Max Temp (°C)", "date": "Date"}
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.warning("No daily max data found.")
+else:
+    st.info("👈 Choose filters and click 'Load & Analyze' to begin.")
