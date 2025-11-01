@@ -1,116 +1,57 @@
 import streamlit as st
 import pandas as pd
 import requests
-import datetime as dt
-from io import StringIO
-import plotly.express as px
+from datetime import datetime, timedelta
 
-# ---------------------- الإعدادات العامة ---------------------- #
+# ---------- إعداد الواجهة ----------
 st.set_page_config(page_title="NASA Weather Dashboard", layout="wide")
-st.title("🌤 NASA Weather Dashboard")
-st.write("Compare hourly weather data from multiple stations using NASA POWER API")
+st.title("☀️ NASA Weather Dashboard")
+st.markdown("تحميل بيانات الطقس من NASA POWER API (ساعية) لعدة محطات في السعودية")
 
-# ---------------------- إعدادات الإدخال ---------------------- #
-stations = {
-    "Riyadh": (24.7136, 46.6753),
-    "Jeddah": (21.4858, 39.1925),
-    "Dammam": (26.4207, 50.0888),
-    "Makkah": (21.3891, 39.8579),
-    "Madinah": (24.5247, 39.5692),
-    "Turaif": (31.6729, 38.6636),
-}
+# ---------- تحميل ملف المحطات ----------
+stations_df = pd.read_excel("stations.xlsx")
+station_names = stations_df["Station Name"].tolist()
 
-parameters = {
-    "T2M": "Air Temperature at 2 Meters (°C)",
-    "RH2M": "Relative Humidity at 2 Meters (%)",
-    "WS2M": "Wind Speed at 2 Meters (m/s)",
-}
+# ---------- اختيار المحطة والمعامل ----------
+selected_station = st.selectbox("📍 Select Station", station_names)
+selected_param = st.selectbox("📊 Select Parameter", ["T2M", "RH2M", "PRECTOT", "WS10M"])
 
-# ---------------------- دوال الأدوات ---------------------- #
-def fetch_hourly_weather_data(lat, lon, start_date, end_date, parameter):
+# ---------- اختيار الفترة الزمنية ----------
+min_date = datetime(2015, 10, 1)
+max_date = datetime(2035, 10, 1)
+col1, col2 = st.columns(2)
+start_date = col1.date_input("Start Date", value=min_date, min_value=min_date, max_value=max_date)
+end_date = col2.date_input("End Date", value=max_date - timedelta(days=1), min_value=min_date, max_value=max_date)
+
+# ---------- إحضار إحداثيات المحطة ----------
+lat = stations_df.loc[stations_df["Station Name"] == selected_station, "Latitude"].values[0]
+lon = stations_df.loc[stations_df["Station Name"] == selected_station, "Longitude"].values[0]
+
+# ---------- دالة جلب البيانات من NASA POWER ----------
+@st.cache_data(show_spinner=True)
+def fetch_weather_data(lat, lon, start_date, end_date, parameter):
     url = (
-        f"https://power.larc.nasa.gov/api/temporal/hourly/point"
-        f"?start={start_date}&end={end_date}&latitude={lat}&longitude={lon}"
-        f"&parameters={parameter}&community=RE&format=CSV"
+        f"https://power.larc.nasa.gov/api/temporal/hourly/point?"
+        f"start={start_date.strftime('%Y%m%d')}&end={end_date.strftime('%Y%m%d')}&"
+        f"latitude={lat}&longitude={lon}&community=ag&parameters={parameter}&format=JSON"
     )
-
     response = requests.get(url)
     if response.status_code != 200:
-        st.error(f"API request failed: {response.status_code}")
-        return pd.DataFrame()
-
-    raw_data = StringIO(response.text)
-    df = pd.read_csv(raw_data, skiprows=10)
-
-    df = df.rename(columns={"YEAR": "year", "MO": "month", "DY": "day", "HR": "hour", parameter: "value"})
-    df["datetime"] = pd.to_datetime(
-        df[["year", "month", "day", "hour"]], errors="coerce"
-    )
-    df = df.dropna(subset=["datetime"])
-    df = df[["datetime", "value"]]
+        return None
+    data = response.json()
+    records = data["properties"]["parameter"][parameter]
+    df = pd.DataFrame.from_dict(records, orient="index", columns=[parameter])
+    df.index = pd.to_datetime(df.index)
+    df.reset_index(inplace=True)
+    df.rename(columns={"index": "datetime"}, inplace=True)
     return df
 
-def calculate_cdd_hdd(df, base_temp=18.0):
-    df["CDD"] = (df["value"] - base_temp).clip(lower=0)
-    df["HDD"] = (base_temp - df["value"]).clip(lower=0)
-    return df
-
-# ---------------------- واجهة المستخدم ---------------------- #
-st.sidebar.header("Select Stations")
-selected_stations = st.sidebar.multiselect("Select Stations", options=stations.keys(), default=["Riyadh"])
-
-st.sidebar.header("Select Parameter")
-selected_param = st.sidebar.selectbox("Select Parameter", options=list(parameters.keys()), index=0)
-
-min_date = dt.date(2005, 10, 1)
-max_date = dt.date(2035, 10, 1)
-
-start_date = st.sidebar.date_input("Start Date", min_value=min_date, max_value=max_date, value=min_date)
-end_date = st.sidebar.date_input("End Date", min_value=min_date, max_value=max_date, value=dt.date(2025, 10, 29))
-
-if start_date > end_date:
-    st.sidebar.error("Start date must be before end date.")
-else:
-    if st.sidebar.button("Get Data"):
-        all_data = []
-        for station in selected_stations:
-            lat, lon = stations[station]
-            df = fetch_hourly_weather_data(
-                lat,
-                lon,
-                start_date.strftime("%Y%m%d"),
-                end_date.strftime("%Y%m%d"),
-                selected_param,
-            )
-            if not df.empty:
-                df["station"] = station
-                df = calculate_cdd_hdd(df)
-                all_data.append(df)
-
-        if all_data:
-            combined_df = pd.concat(all_data)
-            st.subheader("📈 Hourly Time Series")
-            fig = px.line(combined_df, x="datetime", y="value", color="station", title=parameters[selected_param])
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.download_button("⬇️ Download Data as CSV", combined_df.to_csv(index=False), file_name="weather_data.csv")
-
-            # Optional: CDD/HDD plotting
-            if "CDD" in combined_df.columns:
-                st.subheader("Cooling Degree Days (CDD)")
-                fig_cdd = px.line(combined_df, x="datetime", y="CDD", color="station")
-                st.plotly_chart(fig_cdd, use_container_width=True)
-
-                st.subheader("Heating Degree Days (HDD)")
-                fig_hdd = px.line(combined_df, x="datetime", y="HDD", color="station")
-                st.plotly_chart(fig_hdd, use_container_width=True)
-        else:
-            st.warning("No data retrieved. Please try different parameters or date ranges.")
-
-
-
-
-
-
-
-
+# ---------- تحميل البيانات عند الضغط ----------
+if st.button("📥 Get Data"):
+    df = fetch_weather_data(lat, lon, start_date, end_date, selected_param)
+    if df is not None and not df.empty:
+        st.success(f"تم تحميل البيانات ({len(df)} صف)")
+        st.line_chart(df.set_index("datetime")[selected_param])
+        st.download_button("📤 Download CSV", data=df.to_csv(index=False), file_name="weather_data.csv")
+    else:
+        st.error("⚠️ لم يتم تحميل البيانات، تأكد من التاريخ أو أعد المحاولة.")
